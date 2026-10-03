@@ -1,0 +1,1381 @@
+EnterpriseRideHailingIntelligentDriverDispatchEngine
+
+Naveen Kumar
+package com.dispatch;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
+import com.dispatch.dao.DriverDaoImpl;
+import com.dispatch.dao.RideDaoImpl;
+import com.dispatch.dao.RiderDaoImpl;
+import com.dispatch.enums.PaymentMode;
+import com.dispatch.enums.RideType;
+import com.dispatch.facade.DispatchFacade;
+import com.dispatch.models.Driver;
+import com.dispatch.models.Location;
+import com.dispatch.models.Ride;
+import com.dispatch.models.Rider;
+import com.dispatch.strategy.RainSurgePricingStrategy;
+
+public class Main {
+
+	public static void main(String[] args) throws InterruptedException, ExecutionException {
+		System.out.println("=========================================================");
+		System.out.println("   ENTERPRISE RIDE-HAILING DISPATCH ENGINE INITIALIZING  ");
+		System.out.println("=========================================================\n");
+
+		// 1. Initialize DAOs (Data Access Layer)
+		RiderDaoImpl riderDao = new RiderDaoImpl();
+		DriverDaoImpl driverDao = new DriverDaoImpl();
+		RideDaoImpl rideDao = new RideDaoImpl();
+
+		// 2. Populate Driver Registry in Cluster (Koramangala, Bengaluru)
+		Driver d1 = new Driver("DRV-1", "Kishore Kumar", new Location(12.9352, 77.6245));
+		Driver d2 = new Driver("DRV-2", "Sunil Gavaskar", new Location(12.9358, 77.6250));
+		Driver d3 = new Driver("DRV-3", "Kapil Dev", new Location(12.9340, 77.6220));
+
+		driverDao.save(d1);
+		driverDao.save(d2);
+		driverDao.save(d3);
+
+		// 3. Initialize Facade with Rain Surge (1.8x) & 4 Dedicated Consumer Worker
+		// Threads
+		DispatchFacade dispatchFacade = new DispatchFacade(riderDao, driverDao, rideDao, new RainSurgePricingStrategy(),
+				4);
+
+		// 4. Seed 15 Concurrent Riders (Producers)
+		int simulatedRiders = 15;
+		for (int i = 1; i <= simulatedRiders; i++) {
+			String riderId = "USR-" + i;
+			Rider rider = new Rider(riderId, "Rider_" + i, new Location(12.9350, 77.6240));
+			riderDao.save(rider);
+		}
+
+		System.out.println("System Cluster : " + Driver.getSystemClusterId());
+		System.out.println("Drivers Active : " + driverDao.findAll().size());
+		System.out.println("Simulating " + simulatedRiders + " concurrent requests for 3 available drivers...\n");
+
+		// 5. High-Concurrency Stress Test (Latch Synchronized)
+		ExecutorService producerPool = Executors.newFixedThreadPool(8);
+		CountDownLatch starterGun = new CountDownLatch(1);
+		List<Future<String>> futures = new ArrayList<>();
+
+		Location pickupPoint = new Location(12.9350, 77.6240);
+		Location dropoffPoint = new Location(12.9716, 77.5946); // ~8.5 KM Distance
+
+		for (int i = 1; i <= simulatedRiders; i++) {
+			final String rId = "USR-" + i;
+			final boolean addSeat = (i % 2 == 0);
+			final boolean addLuggage = (i % 3 == 0);
+
+			Callable<String> task = () -> {
+				starterGun.await(); // Synchronize release
+				return dispatchFacade.requestRide(rId, pickupPoint, dropoffPoint, RideType.SEDAN, PaymentMode.UPI,
+						addSeat, addLuggage);
+			};
+			futures.add(producerPool.submit(task));
+		}
+
+		starterGun.countDown(); // Fire simultaneous requests
+
+		for (Future<String> f : futures) {
+			f.get();
+		}
+
+		producerPool.shutdown();
+		producerPool.awaitTermination(2, TimeUnit.SECONDS);
+
+		// Allow consumer threads to finish matching
+		Thread.sleep(1500);
+
+		// 6. Simulate Trip Progressions (State Transitions)
+		System.out.println("\n--- Simulating State Transitions (Start -> Complete) ---");
+		for (Ride ride : rideDao.findAll()) {
+			if (ride.getDriver() != null) {
+				ride.startTrip();
+				ride.completeTrip();
+			}
+		}
+
+		// 7. Generate Administrative Revenue & Metrics Report
+		dispatchFacade.generateAdministrativeSummary();
+
+		// 8. Graceful Engine Termination
+		dispatchFacade.shutdown();
+		System.out.println("Engine shutdown complete. Zero resource leaks.");
+	}
+}
+
+-----------------------------------------------------------------------------------------------------
+package com.dispatch.dao;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.dispatch.models.Driver;
+
+public class DriverDaoImpl implements GenericDao<Driver> {
+	private final Map<String, Driver> driverStore = new ConcurrentHashMap<>();
+
+	@Override
+	public void save(Driver entity) {
+		driverStore.put(entity.getId(), entity);
+	}
+
+	@Override
+	public Optional<Driver> findById(String id) {
+		return Optional.ofNullable(driverStore.get(id));
+	}
+
+	@Override
+	public List<Driver> findAll() {
+		return new ArrayList<>(driverStore.values());
+	}
+
+	@Override
+	public void delete(String id) {
+		driverStore.remove(id);
+	}
+}
+
+------------------------------------------------------------------------------------
+package com.dispatch.dao;
+
+import java.util.List;
+import java.util.Optional;
+
+import com.dispatch.models.BaseEntity;
+
+public interface GenericDao<T extends BaseEntity> {
+	void save(T entity);
+
+	Optional<T> findById(String id);
+
+	List<T> findAll();
+
+	void delete(String id);
+}
+
+---------------------------------------------------------------------------------
+package com.dispatch.dao;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.dispatch.models.Ride;
+
+public class RideDaoImpl {
+	private final Map<String, Ride> rideStore = new ConcurrentHashMap<>();
+
+	public void save(Ride ride) {
+		rideStore.put(ride.getRideId(), ride);
+	}
+
+	public Optional<Ride> findById(String id) {
+		return Optional.ofNullable(rideStore.get(id));
+	}
+
+	public List<Ride> findAll() {
+		return new ArrayList<>(rideStore.values());
+	}
+}
+---------------------------------------------------------------------------------
+package com.dispatch.dao;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.dispatch.models.Rider;
+
+public class RiderDaoImpl implements GenericDao<Rider> {
+	private final Map<String, Rider> riderStore = new ConcurrentHashMap<>();
+
+	@Override
+	public void save(Rider entity) {
+		riderStore.put(entity.getId(), entity);
+	}
+
+	@Override
+	public Optional<Rider> findById(String id) {
+		return Optional.ofNullable(riderStore.get(id));
+	}
+
+	@Override
+	public List<Rider> findAll() {
+		return new ArrayList<>(riderStore.values());
+	}
+
+	@Override
+	public void delete(String id) {
+		riderStore.remove(id);
+	}
+}
+------------------------------------------------------------------------------------
+
+package com.dispatch.decorator;
+
+public class BaseRideBill implements RideComponent {
+
+	private final String rideId;
+	private final double baseFare;
+
+	public BaseRideBill(String rideId, double baseFare) {
+		this.rideId = rideId;
+		this.baseFare = baseFare;
+	}
+
+	@Override
+	public double getCost() {
+		return baseFare;
+	}
+
+	@Override
+	public String getDescription() {
+		return "Base Fare [" + rideId + "]";
+	}
+
+}
+-----------------------------------------------------------------------------------
+package com.dispatch.decorator;
+
+public class ChildSeatDecorator extends RideOptionDecorator {
+
+	private static final double CHILD_SEAT_PRICE = 75.0;
+
+	public ChildSeatDecorator(RideComponent decoratedRide) {
+		super(decoratedRide);
+	}
+
+	public double getCost() {
+		return super.getCost() + CHILD_SEAT_PRICE;
+	}
+
+	public String getDescription() {
+		return super.getDescription() + "+Child Safety Seat(Rs.75)";
+	}
+
+}
+---------------------------------------------------------------------------------
+package com.dispatch.decorator;
+
+public class ExtraLuggageDecorator extends RideOptionDecorator {
+
+	private static final double LUGGAGE_PRICE = 50.0;
+
+	public ExtraLuggageDecorator(RideComponent decoratedRide) {
+		super(decoratedRide);
+	}
+
+	public double getCost() {
+		return super.getCost() + LUGGAGE_PRICE;
+	}
+
+	public String getDescription() {
+		return super.getDescription() + "+Extra Lugage Carrier(Rs.50)";
+	}
+
+}
+-------------------------------------------------------------------------------
+package com.dispatch.decorator;
+
+public interface RideComponent {
+	double getCost();
+
+	String getDescription();
+
+}
+------------------------------------------------------------------------------
+package com.dispatch.decorator;
+
+public class RideOptionDecorator implements RideComponent {
+
+	protected final RideComponent decoratedRide;
+
+	public RideOptionDecorator(RideComponent decoratedRide) {
+		super();
+		this.decoratedRide = decoratedRide;
+	}
+
+	@Override
+	public double getCost() {
+		// TODO Auto-generated method stub
+		return decoratedRide.getCost();
+	}
+
+	@Override
+	public String getDescription() {
+		// TODO Auto-generated method stub
+		return decoratedRide.getDescription();
+	}
+
+}
+--------------------------------------------------------------------------------------
+package com.dispatch.enums;
+
+public enum DriverStatus {
+	AVAILABLE, MATCHED, IN_TRANSIT, OFFLINE
+}
+---------------------------------------------------------------
+package com.dispatch.enums;
+
+public enum PaymentMode {
+	UPI, CREDIT_CARD, WALLET, CASH
+
+}
+--------------------------------------------------------------
+package com.dispatch.enums;
+
+public enum PaymentStatus {
+	PENDING, SUCCESSFUL, FAILED, REFUNDED
+
+}
+-----------------------------------------------------------
+package com.dispatch.enums;
+
+public enum RideType {
+	AUTO(30.0, 10.0), SEDAN(50.0, 15.0), SUV(80.0, 22.0);
+
+	private final double basePrice;
+	private final double perKmPrice;
+
+	RideType(double basePrice, double perKmPrice) {
+		this.basePrice = basePrice;
+		this.perKmPrice = perKmPrice;
+
+	}
+
+	public double getBasePrice() {
+		return basePrice;
+	}
+
+	public double getPerKmPrice() {
+		return perKmPrice;
+	}
+
+}
+---------------------------------------------------------------------
+package com.dispatch.event;
+
+import java.time.LocalDateTime;
+
+import com.dispatch.enums.PaymentMode;
+import com.dispatch.enums.RideType;
+import com.dispatch.models.Location;
+
+public class RideRequestEvent {
+	private final String rideId;
+	private final String riderId;
+	private final Location pickup;
+	private final Location dropoff;
+	private final RideType rideType;
+	private final PaymentMode paymentMode;
+	private final boolean needsChildSeat;
+	private final boolean needsExtraLuggage;
+	private final LocalDateTime timestamp;
+
+	public RideRequestEvent(String rideId, String riderId, Location pickup, Location dropoff, RideType rideType,
+			PaymentMode paymentMode, boolean needsChildSeat, boolean needsExtraLuggage) {
+		this.rideId = rideId;
+		this.riderId = riderId;
+		this.pickup = pickup;
+		this.dropoff = dropoff;
+		this.rideType = rideType;
+		this.paymentMode = paymentMode;
+		this.needsChildSeat = needsChildSeat;
+		this.needsExtraLuggage = needsExtraLuggage;
+		this.timestamp = LocalDateTime.now();
+	}
+
+	public String getRideId() {
+		return rideId;
+	}
+
+	public String getRiderId() {
+		return riderId;
+	}
+
+	public Location getPickup() {
+		return pickup;
+	}
+
+	public Location getDropoff() {
+		return dropoff;
+	}
+
+	public RideType getRideType() {
+		return rideType;
+	}
+
+	public PaymentMode getPaymentMode() {
+		return paymentMode;
+	}
+
+	public boolean isNeedsChildSeat() {
+		return needsChildSeat;
+	}
+
+	public boolean isNeedsExtraLuggage() {
+		return needsExtraLuggage;
+	}
+
+	public LocalDateTime getTimestamp() {
+		return timestamp;
+	}
+}
+----------------------------------------------------------------
+package com.dispatch.facade;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+import com.dispatch.dao.DriverDaoImpl;
+import com.dispatch.dao.RideDaoImpl;
+import com.dispatch.dao.RiderDaoImpl;
+import com.dispatch.enums.PaymentMode;
+import com.dispatch.enums.RideType;
+import com.dispatch.event.RideRequestEvent;
+import com.dispatch.models.Location;
+import com.dispatch.models.Rider;
+import com.dispatch.queue.DispatchWorker;
+import com.dispatch.queue.RideRequestProducer;
+import com.dispatch.state.CompletedState;
+import com.dispatch.strategy.PricingStrategy;
+
+public class DispatchFacade {
+
+	private final RiderDaoImpl riderDao;
+	private final DriverDaoImpl driverDao;
+	private final RideDaoImpl rideDao;
+	private final BlockingQueue<RideRequestEvent> queue;
+	private final RideRequestProducer producer;
+	private final List<DispatchWorker> workers;
+	private final ExecutorService workerExecutor;
+	
+	//DispatchFacade dispatchFacade = new DispatchFacade(riderDao, driverDao, rideDao, new RainSurgePricingStrategy(),
+		//	4);
+
+	public DispatchFacade(RiderDaoImpl riderDao, DriverDaoImpl driverDao, RideDaoImpl rideDao,
+			PricingStrategy pricingStrategy, int workerPoolSize) {
+		this.riderDao = riderDao;
+		this.driverDao = driverDao;
+		this.rideDao = rideDao;
+		this.queue = new ArrayBlockingQueue<>(500); // Bounded queue buffer
+		this.producer = new RideRequestProducer(queue);
+		this.workers = new ArrayList<>();
+		this.workerExecutor = Executors.newFixedThreadPool(workerPoolSize);
+
+		for (int i = 1; i <= workerPoolSize; i++) {
+			DispatchWorker worker = new DispatchWorker("Worker-" + i, queue, riderDao, driverDao, rideDao,
+					pricingStrategy);
+			workers.add(worker);
+			workerExecutor.submit(worker);
+		}
+	}
+
+	public String requestRide(String riderId, Location pickup, Location dropoff, RideType rideType,
+			PaymentMode paymentMode, boolean childSeat, boolean luggage) {
+		Optional<Rider> riderOpt = riderDao.findById(riderId);
+		if (!riderOpt.isPresent()) {
+			System.err.println("Invalid Rider ID.");
+			return null;
+		}
+
+		Rider rider = riderOpt.get();
+		if (rider.hasActiveRide()) {
+			System.err.println("Rider " + rider.getName() + " already has an active trip.");
+			return null;
+		}
+
+		String rideId = "TRIP-" + UUID.randomUUID().toString().substring(0, 8);
+		RideRequestEvent event = new RideRequestEvent(rideId, riderId, pickup, dropoff, rideType, paymentMode,
+				childSeat, luggage);
+		rider.setActiveRide(true);
+		producer.publishRequest(event);
+		return rideId;
+	}
+
+	public void generateAdministrativeSummary() {
+		System.out.println("\n==========================================================");
+		System.out.println("          ADMINISTRATIVE REVENUE & METRICS AUDIT          ");
+		System.out.println("==========================================================");
+
+		long totalBookings = rideDao.findAll().size();
+		long completedTrips = rideDao.findAll().stream().filter(r -> r.getState() instanceof CompletedState).count();
+
+		double totalTurnover = rideDao.findAll().stream().filter(r -> r.getState() instanceof CompletedState)
+				.mapToDouble(r -> r.getFare()).sum();
+
+		double platformCommission = totalTurnover * 0.20; // 20% Net Commission
+		double totalDriverPayouts = driverDao.findAll().stream().mapToDouble(d -> d.getEarnings()).sum();
+
+		System.out.println("Total Trips Submitted   : " + totalBookings);
+		System.out.println("Total Trips Completed   : " + completedTrips);
+		System.out.println("Total Gross Billing     : Rs." + String.format("%.2f", totalTurnover));
+		System.out.println("Net Company Commission  : Rs." + String.format("%.2f", platformCommission));
+		System.out.println("Disbursed Driver Payout : Rs." + String.format("%.2f", totalDriverPayouts));
+		System.out.println("==========================================================\n");
+	}
+
+	public void shutdown() throws InterruptedException {
+		workers.forEach(DispatchWorker::stop);
+		workerExecutor.shutdown();
+		workerExecutor.awaitTermination(3, TimeUnit.SECONDS);
+	}
+}
+--------------------------------------------------------------------------------------
+
+package com.dispatch.models;
+
+import java.io.Serializable;
+import java.time.Instant;
+import java.util.Objects;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+public abstract class BaseEntity implements Serializable {
+	 private static final long serialVersionUID = 1L;
+	    private static final Logger LOGGER = Logger.getLogger(BaseEntity.class.getName());
+
+	    // Explicit static variable demonstration
+	    private static String systemClusterId;
+
+	    protected final String id;
+	    protected final String name;
+	    protected final Instant createdAt;
+	    protected Instant updatedAt;
+
+	    // Static Initialization Block (Class-level bootstrapping)
+	    static {
+	        try {
+	            systemClusterId = System.getenv().getOrDefault("CLUSTER_ID", "BLR-REGION-01");
+	            LOGGER.info("BaseEntity initialized with System Cluster ID: " + systemClusterId);
+	        } catch (Exception e) {
+	            systemClusterId = "BLR-REGION-DEFAULT";
+	            LOGGER.log(Level.WARNING, "Failed to read environment cluster ID, fallback used.", e);
+	        }
+	    }
+
+	    // Instance Initialization Block (Executes prior to constructors)
+	    {
+	        this.createdAt = Instant.now();
+	        this.updatedAt = this.createdAt;
+	    }
+
+	    // Overloaded Constructors
+	    public BaseEntity(String id) {
+	        this(id, "UNASSIGNED");
+	    }
+
+	    public BaseEntity(String id, String name) {
+	        this.id = Objects.requireNonNull(id, "Entity 'id' must not be null");
+	        this.name = Objects.requireNonNullElse(name, "UNASSIGNED");
+	    }
+
+	    // Core Getters
+	    public String getId() { 
+	        return id; 
+	    }
+
+	    public String getName() { 
+	        return name; 
+	    }
+
+	    public Instant getCreatedAt() { 
+	        return createdAt; 
+	    }
+
+	    public Instant getUpdatedAt() { 
+	        return updatedAt; 
+	    }
+
+	    public static String getSystemClusterId() { 
+	        return systemClusterId; 
+	    }
+
+	    public static void setSystemClusterId(String clusterId) {
+	        systemClusterId = Objects.requireNonNull(clusterId, "clusterId cannot be null");
+	    }
+
+	    // State Mutation Utility
+	    public void markUpdated() {
+	        this.updatedAt = Instant.now();
+	    }
+
+	    @Override
+	    public boolean equals(Object o) {
+	        if (this == o) return true;
+	        if (o == null || getClass() != o.getClass()) return false;
+	        BaseEntity that = (BaseEntity) o;
+	        return Objects.equals(id, that.id);
+	    }
+
+	    @Override
+	    public int hashCode() {
+	        return Objects.hash(id);
+	    }
+
+	    @Override
+	    public String toString() {
+	        return getClass().getSimpleName() + "{" +
+	                "id='" + id + '\'' +
+	                ", name='" + name + '\'' +
+	                ", cluster='" + systemClusterId + '\'' +
+	                ", createdAt=" + createdAt +
+	                ", updatedAt=" + updatedAt +
+	                '}';
+	    }
+	}
+-----------------------------------------------------------------------------------------
+package com.dispatch.models;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
+
+import com.dispatch.enums.DriverStatus;
+import com.dispatch.observer.DriverObserver;
+
+public class Driver extends BaseEntity implements DriverObserver {
+
+	private Location location;
+	private DriverStatus status;
+	private final ReentrantLock lock = new ReentrantLock(true); // Explicit fair lock
+	private double earnings;
+	// One-to-Many Relationship: Driver has many completed rides
+	private final List<Ride> completedRides;
+	
+	/*// 2. Populate Driver Registry in Cluster (Koramangala, Bengaluru)
+	Driver d1 = new Driver("DRV-1", "Kishore Kumar", new Location(12.9352, 77.6245));
+	Driver d2 = new Driver("DRV-2", "Sunil Gavaskar", new Location(12.9358, 77.6250));
+	Driver d3 = new Driver("DRV-3", "Kapil Dev", new Location(12.9340, 77.6220));*/
+
+	public Driver(String id, String name, Location location) {
+		super(id, name);
+		this.location = location;
+		this.status = DriverStatus.AVAILABLE;
+		this.earnings = 0.0;
+		this.completedRides = new ArrayList<>();
+	}
+
+	public boolean tryAcquireLock() {
+		return lock.tryLock();
+	}
+
+	public void releaseLock() {
+		if (lock.isHeldByCurrentThread()) {
+			lock.unlock();
+		}
+	}
+
+	
+	public void onRideRequested(String rideId, Location pickup) {
+		System.out.println(">> [OBSERVER ALERT] Driver " + getName() + " (" + getId() + ") notified for Ride: " + rideId
+				+ " at " + pickup);
+	}
+
+	public Location getLocation() {
+		return location;
+	}
+
+	public void setLocation(Location location) {
+		this.location = location;
+	}
+
+	public DriverStatus getStatus() {
+		return status;
+	}
+
+	public void setStatus(DriverStatus status) {
+		this.status = status;
+	}
+
+	public double getEarnings() {
+		return earnings;
+	}
+
+	public void addEarnings(double amount) {
+		this.earnings += amount;
+	}
+
+	public void recordCompletedTrip(Ride ride) {
+		this.completedRides.add(ride);
+	}
+
+	public List<Ride> getCompletedRides() {
+		return Collections.unmodifiableList(completedRides);
+	}
+}
+----------------------------------------------------------------------------------
+package com.dispatch.models;
+
+public class Location {
+
+	private final double latitude;
+	private final double longitude;
+
+	public Location(double latitude, double longitude) {
+		this.latitude = latitude;
+		this.longitude = longitude;
+	}
+
+	public double distanceTo(Location other) {
+		if (other == null)
+			return 0.0;
+		double latDiff = Math.toRadians(other.latitude - this.latitude);
+		double lonDiff = Math.toRadians(other.longitude - this.longitude);
+		double a = Math.sin(latDiff / 2) * Math.sin(latDiff / 2) + Math.cos(Math.toRadians(this.latitude))
+				* Math.cos(Math.toRadians(other.latitude)) * Math.sin(lonDiff / 2) * Math.sin(lonDiff / 2);
+		double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+		return 6371.0 * c; // Earth radius ~6371 km
+	}
+
+	public double getLatitude() {
+		return latitude;
+	}
+
+	public double getLongitude() {
+		return longitude;
+	}
+
+	@Override
+	public String toString() {
+		return String.format("(%.4f, %.4f)", latitude, longitude);
+	}
+}
+----------------------------------------------------------------------------------------
+package com.dispatch.models;
+
+import java.time.LocalDateTime;
+
+import com.dispatch.enums.PaymentMode;
+import com.dispatch.enums.PaymentStatus;
+
+public class Payment {
+
+	private final String paymentId;
+	private final String rideId;
+	private final double amount;
+	private final PaymentMode paymentMode;
+	private PaymentStatus status;
+	private final LocalDateTime timestamp;
+
+	public Payment(String paymentId, String rideId, double amount, PaymentMode paymentMode) {
+		this.paymentId = paymentId;
+		this.rideId = rideId;
+		this.amount = amount;
+		this.paymentMode = paymentMode;
+		this.status = PaymentStatus.PENDING;
+		this.timestamp = LocalDateTime.now();
+	}
+
+	public String getPaymentId() {
+		return paymentId;
+	}
+
+	public String getRideId() {
+		return rideId;
+	}
+
+	public double getAmount() {
+		return amount;
+	}
+
+	public PaymentMode getPaymentMode() {
+		return paymentMode;
+	}
+
+	public PaymentStatus getStatus() {
+		return status;
+	}
+
+	public void setStatus(PaymentStatus status) {
+		this.status = status;
+	}
+
+	public LocalDateTime getTimestamp() {
+		return timestamp;
+	}
+}
+------------------------------------------------------------------------------
+package com.dispatch.models;
+
+import com.dispatch.enums.RideType;
+import com.dispatch.state.RequestedState;
+import com.dispatch.state.RideState;
+
+public class Ride {
+
+	private final String rideId;
+	// Association: Many-to-One
+	private final Rider rider;
+	// Association: Many-to-One
+	private Driver driver;
+	// Association: One-to-One
+	private Payment payment;
+
+	private final Location pickup;
+	private final Location dropoff;
+	private final RideType rideType;
+	private double fare;
+	private double surgeMultiplier;
+	private RideState state;
+
+	public Ride(String rideId, Rider rider, Location pickup, Location dropoff, RideType rideType) {
+		this.rideId = rideId;
+		this.rider = rider;
+		this.pickup = pickup;
+		this.dropoff = dropoff;
+		this.rideType = rideType;
+		this.surgeMultiplier = 1.0;
+		this.state = new RequestedState();
+	}
+
+	public void proceedToMatch(Driver matchedDriver) {
+		this.state.handleMatch(this, matchedDriver);
+	}
+
+	public void startTrip() {
+		this.state.handleStart(this);
+	}
+
+	public void completeTrip() {
+		this.state.handleComplete(this);
+	}
+
+	public void cancelTrip() {
+		this.state.handleCancel(this);
+	}
+
+	public String getRideId() {
+		return rideId;
+	}
+
+	public Rider getRider() {
+		return rider;
+	}
+
+	public Driver getDriver() {
+		return driver;
+	}
+
+	public void setDriver(Driver driver) {
+		this.driver = driver;
+	}
+
+	public Payment getPayment() {
+		return payment;
+	}
+
+	public void setPayment(Payment payment) {
+		this.payment = payment;
+	}
+
+	public Location getPickup() {
+		return pickup;
+	}
+
+	public Location getDropoff() {
+		return dropoff;
+	}
+
+	public RideType getRideType() {
+		return rideType;
+	}
+
+	public double getFare() {
+		return fare;
+	}
+
+	public void setFare(double fare) {
+		this.fare = fare;
+	}
+
+	public double getSurgeMultiplier() {
+		return surgeMultiplier;
+	}
+
+	public void setSurgeMultiplier(double surgeMultiplier) {
+		this.surgeMultiplier = surgeMultiplier;
+	}
+
+	public RideState getState() {
+		return state;
+	}
+
+	public void setState(RideState state) {
+		this.state = state;
+	}
+
+	@Override
+	public String toString() {
+		StringBuilder sb = new StringBuilder();
+		sb.append("Ride Details: [ID=").append(rideId).append(", Rider=").append(rider.getName()).append(", Driver=")
+				.append(driver != null ? driver.getName() : "NONE").append(", Type=").append(rideType)
+				.append(", Total Fare=").append(fare).append(", Status=").append(state.getClass().getSimpleName())
+				.append("]");
+		return sb.toString();
+	}
+}
+------------------------------------------------------------------------------------
+package com.dispatch.models;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class Rider extends BaseEntity {
+
+	private Location location;
+	private boolean activeRide;
+	// One-to-Many Relationship: Rider has many historical rides
+	private final List<Ride> tripHistory;
+	
+	/*int simulatedRiders = 15;
+	for (int i = 1; i <= simulatedRiders; i++) {
+		String riderId = "USR-" + i;
+		Rider rider = new Rider(riderId, "Rider_" + i, new Location(12.9350, 77.6240));*/
+
+	public Rider(String id, String name, Location location) {
+		super(id, name);
+		this.location = location;
+		this.activeRide = false;
+		this.tripHistory = new ArrayList<>();
+	}
+
+	public Location getLocation() {
+		return location;
+	}
+
+	public void setLocation(Location location) {
+		this.location = location;
+	}
+
+	public boolean hasActiveRide() {
+		return activeRide;
+	}
+
+	public void setActiveRide(boolean activeRide) {
+		this.activeRide = activeRide;
+	}
+
+	public void addTripToHistory(Ride ride) {
+		this.tripHistory.add(ride);
+	}
+
+	public List<Ride> getTripHistory() {
+		return Collections.unmodifiableList(tripHistory);
+	}
+}
+-----------------------------------------------------------------------------------
+package com.dispatch.observer;
+
+import com.dispatch.models.Location;
+
+public interface DriverObserver {
+	void onRideRequested(String rideId, Location pickup);
+
+}
+--------------------------------------------------------------------------------------
+package com.dispatch.queue;
+
+import java.util.Comparator;
+
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import com.dispatch.dao.DriverDaoImpl;
+import com.dispatch.dao.RideDaoImpl;
+import com.dispatch.dao.RiderDaoImpl;
+import com.dispatch.decorator.BaseRideBill;
+import com.dispatch.decorator.ChildSeatDecorator;
+import com.dispatch.decorator.ExtraLuggageDecorator;
+import com.dispatch.decorator.RideComponent;
+import com.dispatch.enums.DriverStatus;
+import com.dispatch.enums.PaymentStatus;
+import com.dispatch.event.RideRequestEvent;
+import com.dispatch.models.Driver;
+import com.dispatch.models.Payment;
+import com.dispatch.models.Ride;
+import com.dispatch.models.Rider;
+import com.dispatch.strategy.PricingStrategy;
+
+public class DispatchWorker implements Runnable {
+	private final String workerId;
+	private final BlockingQueue<RideRequestEvent> queue;
+	private final RiderDaoImpl riderDao;
+	private final DriverDaoImpl driverDao;
+	private final RideDaoImpl rideDao;
+	private final PricingStrategy pricingStrategy;
+	private volatile boolean active = true;
+
+	public DispatchWorker(String workerId, BlockingQueue<RideRequestEvent> queue, RiderDaoImpl riderDao,
+			DriverDaoImpl driverDao, RideDaoImpl rideDao, PricingStrategy pricingStrategy) {
+		this.workerId = workerId;
+		this.queue = queue;
+		this.riderDao = riderDao;
+		this.driverDao = driverDao;
+		this.rideDao = rideDao;
+		this.pricingStrategy = pricingStrategy;
+	}
+
+	@Override
+	public void run() {
+		while (active || !queue.isEmpty()) {
+			try {
+				RideRequestEvent event = queue.poll(400, TimeUnit.MILLISECONDS);
+				if (event != null) {
+					processEvent(event);
+				}
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				break;
+			}
+		}
+	}
+
+	private void processEvent(RideRequestEvent event) {
+		Optional<Rider> riderOpt = riderDao.findById(event.getRiderId());
+		if (!riderOpt.isPresent())
+			return;
+		Rider rider = riderOpt.get();
+
+		Ride ride = new Ride(event.getRideId(), rider, event.getPickup(), event.getDropoff(), event.getRideType());
+		rideDao.save(ride);
+
+		// Java 8 Streams: Geofence Filter & Euclidean Distance Sort (< 5 KM Radius)
+		List<Driver> candidates = driverDao.findAll().stream().filter(d -> d.getStatus() == DriverStatus.AVAILABLE)
+				.filter(d -> d.getLocation().distanceTo(event.getPickup()) <= 5.0)
+				.sorted(Comparator.comparingDouble(d -> d.getLocation().distanceTo(event.getPickup())))
+				.collect(Collectors.toList());
+
+		// Observer Pattern Broadcast
+		candidates.forEach(d -> d.onRideRequested(ride.getRideId(), event.getPickup()));
+
+		boolean matched = false;
+
+		for (Driver driver : candidates) {
+			// Atomic non-blocking acquisition
+			if (driver.tryAcquireLock()) {
+				try {
+					if (driver.getStatus() == DriverStatus.AVAILABLE) {
+						double distanceKm = event.getPickup().distanceTo(event.getDropoff());
+
+						// 1. Strategy Pattern Surge Computation
+						double baseSurgeFare = pricingStrategy.calculateFare(ride, distanceKm);
+
+						// 2. Decorator Pattern Dynamic Add-ons
+						RideComponent bill = new BaseRideBill(ride.getRideId(), baseSurgeFare);
+						if (event.isNeedsChildSeat()) {
+							bill = new ChildSeatDecorator(bill);
+						}
+						if (event.isNeedsExtraLuggage()) {
+							bill = new ExtraLuggageDecorator(bill);
+						}
+
+						ride.setFare(bill.getCost());
+
+						// 3. One-to-One Payment Entity Association
+						Payment payment = new Payment("PAY-" + UUID.randomUUID().toString().substring(0, 6),
+								ride.getRideId(), bill.getCost(), event.getPaymentMode());
+						payment.setStatus(PaymentStatus.SUCCESSFUL);
+						ride.setPayment(payment);
+
+						// 4. State Pattern Transition
+						ride.proceedToMatch(driver);
+						matched = true;
+
+						System.out.println(" [DISPATCHED] " + workerId + " matched Ride " + ride.getRideId()
+								+ " with Driver " + driver.getName() + " | Bill: " + bill.getDescription()
+								+ " | Total: Rs." + String.format("%.2f", bill.getCost()));
+						break;
+					}
+				} finally {
+					driver.releaseLock();
+				}
+			}
+		}
+
+		if (!matched) {
+			System.out.println(" [UNFULFILLED] " + workerId + " found no available drivers for " + rider.getName());
+			ride.cancelTrip();
+		}
+	}
+
+	public void stop() {
+		this.active = false;
+	}
+}
+-------------------------------------------------------------------------------------------package com.dispatch.queue;
+
+import java.util.concurrent.BlockingQueue;
+
+import com.dispatch.event.RideRequestEvent;
+
+public class RideRequestProducer {
+	private final BlockingQueue<RideRequestEvent> sharedQueue;
+
+	public RideRequestProducer(BlockingQueue<RideRequestEvent> sharedQueue) {
+		this.sharedQueue = sharedQueue;
+	}
+
+	public boolean publishRequest(RideRequestEvent event) {
+		return sharedQueue.offer(event);
+	}
+}
+--------------------------------------------------------------------------------
+package com.dispatch.state;
+
+import com.dispatch.models.Driver;
+import com.dispatch.models.Ride;
+
+public class CancelledState implements RideState {
+	@Override
+	public void handleMatch(Ride ride, Driver driver) {
+		System.err.println("Ride is cancelled.");
+	}
+
+	@Override
+	public void handleStart(Ride ride) {
+		System.err.println("Ride is cancelled.");
+	}
+
+	@Override
+	public void handleComplete(Ride ride) {
+		System.err.println("Ride is cancelled.");
+	}
+
+	@Override
+	public void handleCancel(Ride ride) {
+		System.err.println("Ride is already cancelled.");
+	}
+}
+-----------------------------------------------------------------------------------
+package com.dispatch.state;
+
+import com.dispatch.models.Driver;
+import com.dispatch.models.Ride;
+
+public class CompletedState implements RideState {
+	@Override
+	public void handleMatch(Ride ride, Driver driver) {
+	}
+
+	@Override
+	public void handleStart(Ride ride) {
+	}
+
+	@Override
+	public void handleComplete(Ride ride) {
+	}
+
+	@Override
+	public void handleCancel(Ride ride) {
+	}
+}
+-------------------------------------------------------------------------------
+package com.dispatch.state;
+
+import com.dispatch.enums.DriverStatus;
+import com.dispatch.models.Driver;
+import com.dispatch.models.Ride;
+
+public class MatchedState implements RideState {
+
+	public void handleMatch(Ride ride, Driver driver) {
+		System.err.println("Illegal Transition:Driver already assigned.");
+	}
+
+	public void handleStart(Ride ride) {
+		ride.getDriver().setStatus(DriverStatus.IN_TRANSIT);
+		ride.setState(new TransitState());
+		System.out.println("->[STATE]Ride" + ride.getRideId() + "->IN_TRANSIT.");
+
+	}
+
+	public void handleComplete(Ride ride) {
+		System.err.println("Illegal Transition :Must start ride before completing.");
+	}
+
+	public void handleCancel(Ride ride) {
+		ride.getDriver().setStatus(DriverStatus.AVAILABLE);
+		ride.getRider().setActiveRide(false);
+		ride.setState(new CancelledState());
+
+		System.out.println("->Ride:" + ride.getRideId() + "->Cancelled by user.Driver released.");
+	}
+}
+----------------------------------------------------------------------------------
+package com.dispatch.state;
+
+import com.dispatch.enums.DriverStatus;
+import com.dispatch.models.Driver;
+import com.dispatch.models.Ride;
+
+public class RequestedState implements RideState {
+    @Override
+    public void handleMatch(Ride ride, Driver driver) {
+        ride.setDriver(driver);
+        driver.setStatus(DriverStatus.MATCHED);
+        ride.setState(new MatchedState());
+        System.out.println("-> [STATE] Ride " + ride.getRideId() + " -> MATCHED with Driver " + driver.getName());
+    }
+
+    @Override
+    public void handleStart(Ride ride) {
+        System.err.println("Illegal Transition: Cannot start a ride without a matched driver.");
+    }
+
+    @Override
+    public void handleComplete(Ride ride) {
+        System.err.println("Illegal Transition: Cannot complete an unassigned ride.");
+    }
+
+    @Override
+    public void handleCancel(Ride ride) {
+        ride.setState(new CancelledState());
+        ride.getRider().setActiveRide(false);
+        System.out.println("-> [STATE] Ride " + ride.getRideId() + " -> CANCELLED while searching.");
+    }
+}
+-----------------------------------------------------------------------------------
+package com.dispatch.state;
+
+import com.dispatch.models.Driver;
+import com.dispatch.models.Ride;
+
+public interface RideState {
+	void handleMatch(Ride ride, Driver driver);
+
+	void handleStart(Ride ride);
+
+	void handleComplete(Ride ride);
+
+	void handleCancel(Ride ride);
+
+}
+----------------------------------------------------------------------------------------
+package com.dispatch.state;
+
+import com.dispatch.enums.DriverStatus;
+import com.dispatch.models.Driver;
+import com.dispatch.models.Ride;
+
+public class TransitState implements RideState {
+	@Override
+	public void handleMatch(Ride ride, Driver driver) {
+		System.err.println("Ride in transit.");
+	}
+
+	@Override
+	public void handleStart(Ride ride) {
+		System.err.println("Trip already in transit.");
+	}
+
+	@Override
+	public void handleComplete(Ride ride) {
+		double driverShare = ride.getFare() * 0.80; // 80% Payout
+		Driver driver = ride.getDriver();
+		driver.addEarnings(driverShare);
+		driver.recordCompletedTrip(ride);
+		driver.setStatus(DriverStatus.AVAILABLE);
+		driver.setLocation(ride.getDropoff());
+
+		ride.getRider().setLocation(ride.getDropoff());
+		ride.getRider().setActiveRide(false);
+		ride.getRider().addTripToHistory(ride);
+
+		ride.setState(new CompletedState());
+		System.out.println("-> [STATE] Ride " + ride.getRideId() + " -> COMPLETED. Driver Payout: Rs." + driverShare);
+	}
+
+	@Override
+	public void handleCancel(Ride ride) {
+		System.err.println("Illegal Transition: Cannot cancel ongoing in-transit trip.");
+	}
+}
+---------------------------------------------------------------------------------
+package com.dispatch.strategy;
+
+import com.dispatch.models.Ride;
+
+public class PeakTrafficPricingStrategy implements PricingStrategy {
+
+	private static final double TRAFFIC_MULTIPLIER = 2.4;
+
+	@Override
+	public double calculateFare(Ride ride, double distanceKm) {
+		ride.setSurgeMultiplier(TRAFFIC_MULTIPLIER);
+		double base = ride.getRideType().getBasePrice() + (distanceKm * ride.getRideType().getPerKmPrice());
+		return base * TRAFFIC_MULTIPLIER;
+	}
+}
+-----------------------------------------------------------------------------------
+package com.dispatch.strategy;
+
+import com.dispatch.models.Ride;
+
+public interface PricingStrategy {
+
+	double calculateFare(Ride ride, double distanceKm);
+}
+------------------------------------------------------------------------------------------
+package com.dispatch.strategy;
+
+import com.dispatch.models.Ride;
+
+public class RainSurgePricingStrategy implements PricingStrategy {
+
+	private static final double RAIN_MULTIPLIER = 1.8;
+
+	@Override
+	public double calculateFare(Ride ride, double distanceKm) {
+		ride.setSurgeMultiplier(RAIN_MULTIPLIER);
+		double base = ride.getRideType().getBasePrice() + (distanceKm * ride.getRideType().getPerKmPrice());
+		return base * RAIN_MULTIPLIER;
+	}
+}
+------------------------------------------------------------------------------------
+package com.dispatch.strategy;
+
+import com.dispatch.models.Ride;
+
+public class StandardPricingStrategy implements PricingStrategy {
+
+	@Override
+	public double calculateFare(Ride ride, double distanceKm) {
+		// TODO Auto-generated method stub
+		ride.setSurgeMultiplier(1.0);
+		return ride.getRideType().getBasePrice() + (distanceKm * ride.getRideType().getPerKmPrice());
+	}
+
+}
+-------------------------------------------------------------

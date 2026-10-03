@@ -1,0 +1,12 @@
+=====================================================
+ OFFICIAL HOTEL INVOICE & FOLIO
+      Taj Luxury Residences (Bengaluru)
+=====================================================
+Booking ID   : BK-9003
+Guest Name   : Karthik Subramanian (Passport[M7823901 (IND)])
+Room Assigned: #101 [Deluxe Room]
+Stay Length  : 2 Nights
+Payment Mode : UPI
+Add-on Extras: [Luxury Airport Cab (₹1800.0)]
+Grand Total  : ₹9150.0
+=====================================================

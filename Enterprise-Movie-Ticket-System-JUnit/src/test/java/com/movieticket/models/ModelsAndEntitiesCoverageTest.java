@@ -90,7 +90,7 @@ class ModelsAndEntitiesCoverageTest {
 		assertEquals(Genre.SCI_FI, movie.getGenre());
 		assertEquals(8.8, movie.getRating());
 		assertNotNull(movie.toString());
-		
+
 	}
 
 	@Test

@@ -1,0 +1,12 @@
+=====================================================
+ OFFICIAL HOTEL INVOICE & FOLIO
+      Taj Luxury Residences (Bengaluru)
+=====================================================
+Booking ID   : BK-9003
+Guest Name   : Priya Sharma (Passport[K112233 (IND)])
+Room Assigned: #301 [Executive Suite]
+Stay Length  : 2 Nights
+Payment Mode : DEBIT_CARD
+Add-on Extras: [Luxury Airport Cab (₹1800.0), Spa & Sauna Access (₹2500.0)]
+Grand Total  : ₹27150.0
+=====================================================
